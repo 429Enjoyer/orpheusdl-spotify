@@ -1543,7 +1543,9 @@ class ModuleInterface:
             return None
 
         try:
-            from .desktop_api import SpotifyDeviceFlow, DEVICE_CLIENT_TOKEN
+            # Device flow issues a *desktop* access token (Win32 / Spotify desktop UA). The color-lyrics
+            # endpoint rejects that token if we pretend to be WebPlayer + static client-token (401).
+            from .desktop_api import SpotifyDeviceFlow, BASE_HEADERS, DEVICE_CLIENT_TOKEN
             import time
             # Retrieve or reuse the device token
             if not hasattr(self, '_lyrics_access_token') or getattr(self, '_lyrics_access_token_expires', 0) < time.time():
@@ -1556,25 +1558,59 @@ class ModuleInterface:
 
             import httpx
             client = httpx.Client(timeout=30)
-            client.headers.update({
-                "accept": "application/json",
-                "app-platform": "WebPlayer",
-                "authorization": f"Bearer {self._lyrics_access_token}",
-                "client-token": DEVICE_CLIENT_TOKEN
-            })
-            
+
+            def _lyrics_headers(bearer: str) -> dict:
+                return {**BASE_HEADERS, "accept": "application/json", "authorization": f"Bearer {bearer}"}
+
             # Format track id to base62
             track_id_base62 = track_id.split(':')[-1]
             url = f"https://spclient.wg.spotify.com/color-lyrics/v2/track/{track_id_base62}?format=json&vocalRemoval=false"
-            
+
             if self.debug_mode:
                 self.logger.debug(f"Fetching Spotify lyrics from {url}")
-                
-            resp = client.get(url)
+
+            resp = client.get(url, headers=_lyrics_headers(self._lyrics_access_token))
             if resp.status_code == 404:
                 self.logger.debug(f"Lyrics not found for track {track_id}")
                 return None
-                
+
+            # Retry with PKCE / librespot user token (same desktop client identity as playback OAuth).
+            if resp.status_code == 401:
+                oauth_tok = None
+                api = getattr(self, "spotify_api", None)
+                if api is not None:
+                    for cand in (
+                        getattr(api, "librespot_stored_token", None),
+                        getattr(api, "stored_token", None),
+                    ):
+                        if cand and getattr(cand, "access_token", None) and not cand.expired():
+                            oauth_tok = cand.access_token
+                            break
+                if oauth_tok:
+                    if self.debug_mode:
+                        self.logger.debug("Lyrics 401 with device token; retrying with OAuth access token (desktop headers).")
+                    resp = client.get(url, headers=_lyrics_headers(oauth_tok))
+                    if resp.status_code == 404:
+                        self.logger.debug(f"Lyrics not found for track {track_id}")
+                        return None
+
+            # Last resort: legacy WebPlayer + client-token (works for some cookie/token combinations).
+            if resp.status_code == 401:
+                if self.debug_mode:
+                    self.logger.debug("Lyrics still 401; trying WebPlayer + client-token headers.")
+                resp = client.get(
+                    url,
+                    headers={
+                        "accept": "application/json",
+                        "app-platform": "WebPlayer",
+                        "authorization": f"Bearer {self._lyrics_access_token}",
+                        "client-token": DEVICE_CLIENT_TOKEN,
+                    },
+                )
+                if resp.status_code == 404:
+                    self.logger.debug(f"Lyrics not found for track {track_id}")
+                    return None
+
             resp.raise_for_status()
             data = resp.json()
             

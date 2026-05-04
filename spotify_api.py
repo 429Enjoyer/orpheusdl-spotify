@@ -578,9 +578,14 @@ class SpotifyAPI:
         # Create main OAuth handler for Web API
         self.oauth_handler = OAuth(main_client_id, REDIRECT_URI, OAUTH_SCOPES, self.logger, client_secret=main_client_secret)
 
-        # Librespot download auth uses same PKCE app credentials from settings (fallback to built-in CLIENT_ID)
+        # Librespot/Mercury streaming must use Spotify's desktop client_id. Custom developer app tokens
+        # authenticate the user but get 403 on get_metadata / content_feeder (Spotify server-side policy).
         self.librespot_oauth_handler = OAuth(
-            main_client_id, REDIRECT_URI, OAUTH_SCOPES, self.logger, client_secret=main_client_secret
+            DESKTOP_CLIENT_ID, REDIRECT_URI, OAUTH_SCOPES, self.logger, client_secret=None
+        )
+        self.logger.info(
+            "Using Desktop Client ID for librespot audio streaming (PKCE); "
+            "custom Client ID from settings is for Web API / Client Credentials only."
         )
         
         # Initialize Web API client (lazy initialized)
@@ -780,23 +785,25 @@ class SpotifyAPI:
 
         client_id_cfg = (self.config.get("client_id") or "").strip() if self.config else ""
         client_secret_cfg = (self.config.get("client_secret") or "").strip() if self.config else ""
-        missing_oauth = []
-        if not client_id_cfg:
-            missing_oauth.append("client ID")
-        if not client_secret_cfg:
-            missing_oauth.append("client secret")
-        if missing_oauth:
-            msg = (
-                "Spotify credentials are missing. "
-                f"Please fill in: {', '.join(missing_oauth)} "
-                "(create an app in the Spotify Developer Dashboard)."
-            )
-            self.logger.error(msg)
-            raise SpotifyConfigError(msg)
-        
-        # Log which client identity is being used with a clear banner as requested
+
         handler_client_id = self.oauth_handler.client_id if self.oauth_handler else None
-        is_official = (handler_client_id == DEVICE_CLIENT_ID or handler_client_id == CLIENT_ID)
+        # Librespot flow always uses built-in desktop client (PKCE public client — no dashboard secret).
+        is_official = handler_client_id in (DEVICE_CLIENT_ID, CLIENT_ID, DESKTOP_CLIENT_ID)
+        if not is_official:
+            missing_oauth = []
+            if not client_id_cfg:
+                missing_oauth.append("client ID")
+            if not client_secret_cfg:
+                missing_oauth.append("client secret")
+            if missing_oauth:
+                msg = (
+                    "Spotify credentials are missing. "
+                    f"Please fill in: {', '.join(missing_oauth)} "
+                    "(create an app in the Spotify Developer Dashboard)."
+                )
+                self.logger.error(msg)
+                raise SpotifyConfigError(msg)
+
         
         retry_suffix = " (Session Creation Failed)" if is_session_retry else ""
         banner = f"""
@@ -854,15 +861,34 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.warning("Cannot fetch user details without an access token.")
             return None
         headers = {'Authorization': f'Bearer {access_token}'}
-        try:
-            response = requests.get(API_URL + "me", headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
-            response.raise_for_status()
-            user_data = response.json()
-            self.logger.info(f"Successfully fetched user details: ID={user_data.get('id')}, Market={user_data.get('country')}")
-            return user_data
-        except requests.RequestException as e:
-            self.logger.error(f"Error fetching user details: {e}")
-            return None
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                response = requests.get(API_URL + "me", headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+                if response.status_code == 429 and attempt + 1 < max_attempts:
+                    ra = response.headers.get("Retry-After")
+                    try:
+                        sleep_s = min(45.0, float(ra)) if ra is not None else min(12.0, 2.0 * (attempt + 1))
+                    except (TypeError, ValueError):
+                        sleep_s = min(12.0, 2.0 * (attempt + 1))
+                    self.logger.warning(
+                        "Spotify /v1/me rate limited (429). Waiting %.1fs then retry %d/%d.",
+                        sleep_s,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                response.raise_for_status()
+                user_data = response.json()
+                self.logger.info(
+                    f"Successfully fetched user details: ID={user_data.get('id')}, Market={user_data.get('country')}"
+                )
+                return user_data
+            except requests.RequestException as e:
+                self.logger.error(f"Error fetching user details: {e}")
+                return None
+        return None
 
     def _clear_credentials(self):
         """Clear Spotify credentials file to force re-authentication."""
@@ -872,6 +898,35 @@ Searching and browsing metadata does NOT require authentication.
                 self.logger.info(f"Removed credentials file: {self.credentials_file_path}")
             except OSError as e:
                 self.logger.warning(f"Could not remove credentials file {self.credentials_file_path}: {e}")
+
+    def _backfill_credentials_spotify_username_if_placeholder(self) -> None:
+        """If /v1/me failed during OAuth, credentials may still say PKCE_USER_*; patch from librespot."""
+        try:
+            if not self.librespot_session:
+                return
+            real = (self.librespot_session.username() or "").strip()
+            if not real:
+                return
+            if not os.path.exists(self.credentials_file_path):
+                return
+            with open(self.credentials_file_path, "r", encoding="utf-8") as f:
+                cred = json.load(f)
+            cur = (cred.get("spotify_username") or "").strip()
+            placeholders = (
+                "",
+                "PKCE_USER_UNKNOWN",
+                "PKCE_USER_NEW",
+                "PKCE_USER",
+                "PKCE_LibrespotUser",
+            )
+            if cur and cur not in placeholders:
+                return
+            cred["spotify_username"] = real
+            with open(self.credentials_file_path, "w", encoding="utf-8") as f:
+                json.dump(cred, f, indent=4)
+            self.logger.info("Updated spotify_username in credentials from librespot session (was placeholder).")
+        except Exception as e:
+            self.logger.debug("Could not backfill spotify_username: %s", e)
 
     def _create_librespot_session_from_oauth(self) -> bool:
         """Create librespot session using OAuth token with global TokenProvider patch."""
@@ -960,6 +1015,7 @@ Searching and browsing metadata does NOT require authentication.
                 except Exception as e_meta_test:
                     self.logger.error(f"Post-session Librespot test call failed: {e_meta_test}", exc_info=True)
 
+                self._backfill_credentials_spotify_username_if_placeholder()
                 return True
             self.logger.error("Librespot builder.create() returned None.")
             return False
@@ -987,20 +1043,12 @@ Searching and browsing metadata does NOT require authentication.
         self.logger.info("Attempting to authenticate and initialize librespot session for downloads...")
 
         username = (self.config.get("username", "") or "").strip() if self.config else ""
-        client_id = (self.config.get("client_id", "") or "").strip() if self.config else ""
-        client_secret = (self.config.get("client_secret", "") or "").strip() if self.config else ""
-        missing = []
         if not username:
-            missing.append("username")
-        if not client_id:
-            missing.append("client ID")
-        if not client_secret:
-            missing.append("client secret")
-        if missing:
             error_msg = (
-                "Spotify credentials are required for downloading. "
-                f"Please fill in: {', '.join(missing)}. "
-                "Use the OrpheusDL GUI Settings tab (Spotify).\n\n"
+                "Spotify username is required for librespot downloads. "
+                "Set it in the OrpheusDL GUI Settings tab (Spotify).\n\n"
+                "Optional: add Client ID and Client Secret from the Spotify Developer Dashboard "
+                "for Web API metadata (ISRC, etc.); librespot uses the built-in Desktop app for playback.\n\n"
                 "Note: Searching and browsing metadata does NOT require authentication."
             )
             self.logger.error(error_msg)
@@ -2386,9 +2434,9 @@ Searching and browsing metadata does NOT require authentication.
                         label = cp_text.strip()
                         self.logger.info(f"Extracted Label from Copyright: '{label}'")
 
-            # Fetch Credits (Composers/Writers)
-            composers = self._get_track_credits(track_id)
-            
+            # Composer/credits via Spotify embed GraphQL are omitted (getTrackCredits returns 401 for this client).
+            composers = None
+
             tags_obj = Tags(
                 album_artist=artist_names, # Use track artists as fallback
                 composer=composers,
@@ -2646,45 +2694,6 @@ Searching and browsing metadata does NOT require authentication.
         except Exception as e:
             self.logger.error(f"Unexpected error in get_album_info for {album_id}: {e}", exc_info=True)
             raise SpotifyApiError(f"An unexpected error occurred while fetching album {album_id}: {e}")
-
-    def _get_track_credits(self, track_id: str) -> Optional[List[str]]:
-        """
-        Fetches track credits (writers/composers) from Spotify's internal GraphQL API.
-        """
-        try:
-            # Always use anonymous for GraphQL to avoid 401/403 with non-official tokens
-            credits_data = self.embed_client.get_track_credits(track_id, external_token=None)
-            
-            track_union = credits_data.get('trackUnion', {})
-            credits_obj = track_union.get('credits', {})
-            role_credits = credits_obj.get('items', [])
-            
-            writers = []
-            for role in role_credits:
-                role_title = role.get('role', '').lower()
-                # "Writer" usually covers composers and lyricists on Spotify
-                if 'writer' in role_title or 'composer' in role_title:
-                    artists = role.get('artists', [])
-                    for artist in artists:
-                        name = artist.get('name')
-                        if name and name not in writers:
-                            writers.append(name)
-            
-            if writers:
-                self.logger.info(f"Successfully retrieved writers for {track_id} via GraphQL: {writers}")
-                return writers
-                
-            return None
-            
-        except Exception as e:
-            error_text = str(e)
-            if "unauthorized (401)" in error_text.lower():
-                self.logger.warning(
-                    f"GraphQL credits unavailable for {track_id} (401). Continuing without composer metadata."
-                )
-            else:
-                self.logger.warning(f"Error fetching credits for {track_id} via GraphQL: {e}")
-            return None
 
     def get_playlist_info(self, playlist_id: str, metadata: Optional['PlaylistInfo'] = None, _retry_attempted: bool = False) -> Optional[dict]:
         self.logger.info(f"SpotifyAPI: Attempting to get playlist info (Embed API) for ID: {playlist_id}")

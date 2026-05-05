@@ -1,6 +1,7 @@
 import json
 import traceback
 import os
+import struct
 import requests
 import argparse
 import logging
@@ -140,6 +141,18 @@ def get_code_challenge(verifier: str) -> str:
     """Create a PKCE code challenge from a code verifier."""
     digest = hashlib.sha256(verifier.encode('utf-8')).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b'=').decode('utf-8')
+
+
+def _is_retryable_librespot_connect_error(exc: BaseException) -> bool:
+    """True when AP/TLS connect returned a short read or dropped socket — same OAuth token may work on retry."""
+    if isinstance(exc, struct.error):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, BrokenPipeError, EOFError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
 
 # --- OAuth Classes ---
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
@@ -594,7 +607,8 @@ class SpotifyAPI:
         # Token storage
         self.stored_token: Optional[StoredToken] = None
         
-        self.last_custom_provider_id_created: Optional[int] = None 
+        self.last_custom_provider_id_created: Optional[int] = None
+        self._librespot_session_failure_requires_new_oauth: bool = False
 
         # Determine credentials directory
         self.credentials_dir = _get_spotify_credentials_dir()
@@ -865,14 +879,21 @@ Searching and browsing metadata does NOT require authentication.
         for attempt in range(max_attempts):
             try:
                 response = requests.get(API_URL + "me", headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
-                if response.status_code == 429 and attempt + 1 < max_attempts:
-                    ra = response.headers.get("Retry-After")
-                    try:
-                        sleep_s = min(45.0, float(ra)) if ra is not None else min(12.0, 2.0 * (attempt + 1))
-                    except (TypeError, ValueError):
-                        sleep_s = min(12.0, 2.0 * (attempt + 1))
+                # After playlist/album metadata bursts, /v1/me often returns 429 with a long Retry-After.
+                # Blocking here freezes the download worker for tens of seconds and feels "stuck".
+                # Profile data is optional: we persist tokens with a placeholder and librespot backfills
+                # username via _backfill_credentials_spotify_username_if_placeholder().
+                if response.status_code == 429:
                     self.logger.warning(
-                        "Spotify /v1/me rate limited (429). Waiting %.1fs then retry %d/%d.",
+                        "Spotify /v1/me rate limited (429); skipping profile fetch. "
+                        "Downloads will continue; username can be filled after librespot connects."
+                    )
+                    return None
+                if response.status_code >= 500 and attempt + 1 < max_attempts:
+                    sleep_s = min(8.0, 1.5 * (attempt + 1))
+                    self.logger.warning(
+                        "Spotify /v1/me server error %s; retry in %.1fs (%d/%d).",
+                        response.status_code,
                         sleep_s,
                         attempt + 1,
                         max_attempts,
@@ -934,6 +955,8 @@ Searching and browsing metadata does NOT require authentication.
             self.logger.error("No valid OAuth token available for librespot session creation.")
             return False
 
+        self._librespot_session_failure_requires_new_oauth = False
+
         spotify_username_for_librespot = "PKCE_LibrespotUser"
         if os.path.exists(self.credentials_file_path):
             try:
@@ -973,68 +996,94 @@ Searching and browsing metadata does NOT require authentication.
             librespot.core._truly_original_token_provider_for_restore = librespot.core.TokenProvider
             self.logger.info("GLOBAL_PATCH_DEBUG: Stored _truly_original_token_provider_for_restore.")
 
-        librespot.core.TokenProvider = temporary_token_provider_factory_for_patch
-
-        try:
-            conf_builder = LibrespotSession.Configuration.Builder()
-            conf_builder.set_store_credentials(False)
-            cache_path = os.path.join(self.credentials_dir, ".librespot_cache")
-            os.makedirs(cache_path, exist_ok=True)
-            conf_builder.set_cache_dir(cache_path)
-            conf_builder.set_cache_enabled(True)
-            conf = conf_builder.build()
-
-            builder = LibrespotSession.Builder(conf)
-
-            auth_type_for_oauth = Authentication_pb2.AuthenticationType.values()[3]
-            self.logger.info(
-                f"Using AuthenticationType index 3 for OAuth: {Authentication_pb2.AuthenticationType.Name(auth_type_for_oauth)}"
-            )
-
-            credentials_pb = Authentication_pb2.LoginCredentials(
-                username=spotify_username_for_librespot,
-                typ=auth_type_for_oauth,
-                auth_data=self.stored_token.access_token.encode("utf-8"),
-            )
-            builder.login_credentials = credentials_pb
-
-            self.logger.info("GLOBAL_PATCH_DEBUG: About to call builder.create()...")
-            self.librespot_session = builder.create()
-
-            if self.librespot_session:
-                self.logger.info(
-                    f"Librespot session created. Username: {self.librespot_session.username()}. "
-                    f"Device ID: {self.librespot_session.device_id()}"
+        max_connect_attempts = 3
+        for connect_attempt in range(max_connect_attempts):
+            if connect_attempt > 0:
+                delay = min(3.0, 1.0 + connect_attempt)
+                self.logger.warning(
+                    "Retrying librespot AP connect in %.1fs (attempt %d/%d)...",
+                    delay,
+                    connect_attempt + 1,
+                    max_connect_attempts,
                 )
-                try:
-                    example_track_id = TrackId.from_uri("spotify:track:0VjIjW4GlUZAMYd2vXMi3b")
-                    track_meta = self.librespot_session.api().get_metadata_4_track(example_track_id)
+                time.sleep(delay)
+
+            librespot.core.TokenProvider = temporary_token_provider_factory_for_patch
+            try:
+                conf_builder = LibrespotSession.Configuration.Builder()
+                conf_builder.set_store_credentials(False)
+                cache_path = os.path.join(self.credentials_dir, ".librespot_cache")
+                os.makedirs(cache_path, exist_ok=True)
+                conf_builder.set_cache_dir(cache_path)
+                conf_builder.set_cache_enabled(True)
+                conf = conf_builder.build()
+
+                builder = LibrespotSession.Builder(conf)
+
+                auth_type_for_oauth = Authentication_pb2.AuthenticationType.values()[3]
+                self.logger.info(
+                    f"Using AuthenticationType index 3 for OAuth: {Authentication_pb2.AuthenticationType.Name(auth_type_for_oauth)}"
+                )
+
+                credentials_pb = Authentication_pb2.LoginCredentials(
+                    username=spotify_username_for_librespot,
+                    typ=auth_type_for_oauth,
+                    auth_data=self.stored_token.access_token.encode("utf-8"),
+                )
+                builder.login_credentials = credentials_pb
+
+                self.logger.info("GLOBAL_PATCH_DEBUG: About to call builder.create()...")
+                self.librespot_session = builder.create()
+
+                if self.librespot_session:
                     self.logger.info(
-                        f"Post-session Librespot test OK. Track: {track_meta.name if track_meta else 'Unknown'}"
+                        f"Librespot session created. Username: {self.librespot_session.username()}. "
+                        f"Device ID: {self.librespot_session.device_id()}"
                     )
-                except Exception as e_meta_test:
-                    self.logger.error(f"Post-session Librespot test call failed: {e_meta_test}", exc_info=True)
+                    try:
+                        example_track_id = TrackId.from_uri("spotify:track:0VjIjW4GlUZAMYd2vXMi3b")
+                        track_meta = self.librespot_session.api().get_metadata_4_track(example_track_id)
+                        self.logger.info(
+                            f"Post-session Librespot test OK. Track: {track_meta.name if track_meta else 'Unknown'}"
+                        )
+                    except Exception as e_meta_test:
+                        self.logger.error(f"Post-session Librespot test call failed: {e_meta_test}", exc_info=True)
 
-                self._backfill_credentials_spotify_username_if_placeholder()
-                return True
-            self.logger.error("Librespot builder.create() returned None.")
-            return False
+                    self._backfill_credentials_spotify_username_if_placeholder()
+                    return True
 
-        except librespot.core.Session.SpotifyAuthenticationException as auth_exc:
-            self.logger.error(f"Librespot authentication failed during session creation: {auth_exc}")
-            self.librespot_session = None
-            return False
-        except MercuryClient.MercuryException as me:
-            self.logger.error(f"MercuryException during builder.create(): {me}", exc_info=True)
-            self.librespot_session = None
-            return False
-        except Exception as e:
-            self.logger.error(f"Unexpected exception during Librespot session creation: {e}", exc_info=True)
-            self.librespot_session = None
-            return False
-        finally:
-            if hasattr(librespot.core, "_truly_original_token_provider_for_restore"):
-                librespot.core.TokenProvider = librespot.core._truly_original_token_provider_for_restore
+                self.logger.error("Librespot builder.create() returned None.")
+                self.librespot_session = None
+                return False
+
+            except librespot.core.Session.SpotifyAuthenticationException as auth_exc:
+                self.logger.error(f"Librespot authentication failed during session creation: {auth_exc}")
+                self._librespot_session_failure_requires_new_oauth = True
+                self.librespot_session = None
+                return False
+
+            except MercuryClient.MercuryException as me:
+                self.logger.error(f"MercuryException during builder.create(): {me}", exc_info=True)
+                self.librespot_session = None
+                if connect_attempt + 1 < max_connect_attempts:
+                    self.logger.warning("Will retry librespot session after Mercury error.")
+                    continue
+                return False
+
+            except Exception as e:
+                self.librespot_session = None
+                if connect_attempt + 1 < max_connect_attempts and _is_retryable_librespot_connect_error(e):
+                    self.logger.warning(
+                        "Librespot connect failed with retryable error: %s",
+                        e,
+                    )
+                    continue
+                self.logger.error(f"Unexpected exception during Librespot session creation: {e}", exc_info=True)
+                return False
+
+            finally:
+                if hasattr(librespot.core, "_truly_original_token_provider_for_restore"):
+                    librespot.core.TokenProvider = librespot.core._truly_original_token_provider_for_restore
 
         return False
 
@@ -1088,19 +1137,30 @@ Searching and browsing metadata does NOT require authentication.
             return True
 
         self.logger.error("Failed to create Librespot session with loaded/refreshed credentials.")
-        self._clear_credentials()
-        self.oauth_handler = self.librespot_oauth_handler
 
-        if self._perform_oauth_flow():
-            self.librespot_stored_token = self.stored_token
-            if self._create_librespot_session_from_oauth():
-                self.logger.info("Successfully initialized Librespot session after re-authentication.")
+        if self._librespot_session_failure_requires_new_oauth:
+            self._clear_credentials()
+            self.oauth_handler = self.librespot_oauth_handler
+
+            if self._perform_oauth_flow():
+                self.librespot_stored_token = self.stored_token
                 self.oauth_handler = original_oauth_handler
                 self.stored_token = self.librespot_stored_token
-                return True
+                if self._create_librespot_session_from_oauth():
+                    self.logger.info("Successfully initialized Librespot session after re-authentication.")
+                    return True
+
+            self.oauth_handler = original_oauth_handler
+            self.logger.error(
+                "CRITICAL: Failed to create Librespot session even after re-authentication attempt."
+            )
+            return False
 
         self.oauth_handler = original_oauth_handler
-        self.logger.error("CRITICAL: Failed to create Librespot session even after re-authentication attempt.")
+        self.logger.warning(
+            "OAuth tokens were left unchanged (failure looked like a network/AP glitch, not bad credentials). "
+            "Retry the download; librespot will reconnect."
+        )
         return False
 
     def _is_session_valid(self, session_obj: Optional[LibrespotSession]) -> bool:

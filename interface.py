@@ -102,7 +102,7 @@ module_information = ModuleInformation(
     login_behaviour=ManualEnum.manual,
     global_settings={
         "username": "",
-        "download_pause_seconds": 15,
+        "download_pause_seconds": 30,
         "client_id": "",
         "client_secret": "",
         "cookies_path": "./config/spotify-cookies.txt",

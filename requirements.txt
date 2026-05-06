@@ -1,7 +1,7 @@
 # Requirements for the OrpheusDL Spotify module
 # Spotify Desktop API is now the only stream method.
 pkce>=1.0.3
-unplayplay>=0.0.1
+unplayplay==0.0.9
 pycryptodome
 protobuf
 httpx

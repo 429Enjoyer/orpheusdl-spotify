@@ -637,6 +637,10 @@ class SpotifyAPI:
                 handler.addFilter(audio_key_filter)
         self._audio_key_filter = audio_key_filter
 
+        # Reused across desktop downloads in one process — token refresh + spclient resolve once per cookie/DLL pair.
+        self._desktop_spotify_api = None
+        self._desktop_spotify_api_key: Optional[tuple] = None
+
     @staticmethod
     def _parse_use_spotify_dll(cfg: Optional[dict]) -> bool:
         """True = Desktop API + Spotify.dll; False = Librespot OAuth."""
@@ -1911,11 +1915,13 @@ Searching and browsing metadata does NOT require authentication.
         self.librespot_stored_token = None
         self.stored_token = None
         self.user_market = None
+        self._desktop_spotify_api = None
+        self._desktop_spotify_api_key = None
         self.logger.info("Cleared Spotify session state (desktop + librespot).")
 
     def _download_using_desktop_api(self, track_id_base62: str, track_info_obj, quality_tier, download_options) -> Optional['TrackDownloadInfo']:
         try:
-            from .desktop_api import DesktopSpotifyApi
+            from .desktop_api import DesktopSpotifyApi, DesktopSpotifyHttp403
         except ImportError as e:
             self.logger.error(f"Could not load desktop_api: {e}")
             raise SpotifyApiError(f"Desktop API not available ({e}). Did you install unplayplay?")
@@ -1947,12 +1953,16 @@ Searching and browsing metadata does NOT require authentication.
 
         self.logger.debug(f"Initializing Desktop API flow for {track_id_base62}...")
 
-
+        dll_abs = os.path.normcase(os.path.abspath(dll_path))
+        cache_key = (sp_dc, dll_abs)
 
         try:
-            api = DesktopSpotifyApi(sp_dc, dll_path)
-            api.authenticate()
-            
+            if self._desktop_spotify_api is None or self._desktop_spotify_api_key != cache_key:
+                self._desktop_spotify_api = DesktopSpotifyApi(sp_dc, dll_path)
+                self._desktop_spotify_api_key = cache_key
+            api = self._desktop_spotify_api
+            api._ensure_auth()
+
             from utils.models import CodecEnum
             qt_str = getattr(quality_tier, 'name', str(quality_tier)).upper()
             if download_options and hasattr(download_options, "codec") and getattr(download_options, "codec", None) == CodecEnum.FLAC:
@@ -2065,6 +2075,14 @@ Searching and browsing metadata does NOT require authentication.
                 different_codec=final_codec
             )
 
+        except DesktopSpotifyHttp403:
+            self.logger.warning(
+                "Desktop API HTTP 403 for track %s — skipping (CDN or entitlement).",
+                track_id_base62,
+            )
+            raise SpotifyTrackUnavailableError(
+                "Access forbidden (403) for this track — skipping."
+            )
         except SpotifyTrackUnavailableError:
             raise
         except SpotifyApiError as e:

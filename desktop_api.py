@@ -48,6 +48,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class DesktopSpotifyHttp403(RuntimeError):
+    """CDN or Spotify endpoint returned 403 — skip this track and continue the batch."""
+
+    pass
+
+
 # ─── Desktop Client Identity ───────────────────────────────────────────────────
 # Must match the Spotify.dll version to receive correct PlayPlay key material.
 # spotify-dl-cli uses these exact headers; OrpheusDL was sending browser/WebPlayer
@@ -216,13 +223,19 @@ class DesktopHttpClient:
     def update_token(self, bearer: str):
         self._session.headers["authorization"] = f"Bearer {bearer}"
 
+    @staticmethod
+    def raise_for_status(resp: requests.Response) -> None:
+        if resp.status_code == 403:
+            raise DesktopSpotifyHttp403(f"HTTP 403: {getattr(resp, 'url', '') or ''}")
+        resp.raise_for_status()
+
     def post_protobuf(self, url: str, payload: bytes) -> requests.Response:
         resp = self._session.post(
             url, data=payload,
             headers={"content-type": "application/x-protobuf"},
             timeout=TIMEOUT,
         )
-        resp.raise_for_status()
+        self.raise_for_status(resp)
         return resp
 
     def get_protobuf(self, url: str) -> bytes:
@@ -231,12 +244,12 @@ class DesktopHttpClient:
             headers={"accept": "application/x-protobuf"},
             timeout=TIMEOUT,
         )
-        resp.raise_for_status()
+        self.raise_for_status(resp)
         return resp.content
 
     def head(self, url: str) -> requests.Response:
         resp = self._session.head(url, timeout=TIMEOUT)
-        resp.raise_for_status()
+        self.raise_for_status(resp)
         return resp
 
     def stream(self, url: str) -> requests.Response:
@@ -342,6 +355,7 @@ class DesktopSpotifyApi:
         self._http: Optional[DesktopHttpClient] = None
         self._access_token: Optional[str] = None
         self._token_expire_time: int = 0
+        self._refresh_token: Optional[str] = None
 
         # KeyEmu (try direct, fallback to subprocess bridge)
         self.key_emu = None
@@ -358,20 +372,59 @@ class DesktopSpotifyApi:
         """Obtain access token via device flow and initialize the HTTP client."""
         flow = SpotifyDeviceFlow(self.sp_dc)
         token_data = flow.get_token()
+        self._apply_token_response(token_data)
+        logger.info("Desktop API authenticated via device flow.")
+
+    def _apply_token_response(self, token_data: dict) -> None:
         self._access_token = token_data["access_token"]
         self._token_expire_time = int(time.time()) + int(token_data.get("expires_in", 3600))
+        rt = token_data.get("refresh_token")
+        if rt:
+            self._refresh_token = rt
 
         if self._http is None:
             self._http = DesktopHttpClient(self._access_token)
         else:
             self._http.update_token(self._access_token)
-        logger.info("Desktop API authenticated via device flow.")
+
+    def _refresh_access_token(self) -> None:
+        """Rotate access token using refresh_token (same pattern as spotify-dl-cli)."""
+        if not self._refresh_token:
+            raise RuntimeError("No refresh_token for Desktop API")
+
+        response = requests.post(
+            DEVICE_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": CLIENT_ID,
+            },
+            headers={**BASE_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        self._apply_token_response(token_data)
+        logger.info(
+            "Desktop API refreshed access token (expires_in=%s).",
+            token_data.get("expires_in", "?"),
+        )
 
     def _ensure_auth(self):
-        """Refresh auth if token is expired or about to expire."""
+        """Use refresh_token when possible; otherwise device flow (long sessions > 1h)."""
         now = int(time.time())
-        if not self._access_token or now >= max(0, self._token_expire_time - 60):
-            self.authenticate()
+        margin = 300  # align with spotify-dl-cli: refresh before expiry (±5 min)
+        if self._access_token and now < self._token_expire_time - margin:
+            return
+
+        if self._refresh_token:
+            try:
+                self._refresh_access_token()
+                return
+            except Exception as exc:
+                logger.warning("Desktop token refresh failed (%s); running device flow again.", exc)
+
+        self.authenticate()
 
     def _build_url(self, path: str) -> str:
         return urljoin(self._spclient_base, path)
@@ -471,6 +524,8 @@ class DesktopSpotifyApi:
             audio_files.ParseFromString(audio_ext.extension_data[0].extension_data.value)
 
             return [f.file.format for f in audio_files.files]
+        except DesktopSpotifyHttp403:
+            raise
         except Exception:
             return []
 
@@ -622,7 +677,7 @@ class DesktopSpotifyApi:
         )
 
         with self._http.stream(url) as resp:
-            resp.raise_for_status()
+            DesktopHttpClient.raise_for_status(resp)
 
             def decrypt_chunks():
                 for chunk in resp.iter_content(chunk_size=65536):

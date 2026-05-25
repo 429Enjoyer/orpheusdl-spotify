@@ -168,6 +168,42 @@ class ModuleInterface:
             return False
         return str(val).lower() in ("true", "1", "yes")
 
+    def _ensure_librespot_authenticated(self, context_message: str, silent: bool = False) -> bool:
+        """Librespot session required for podcast episodes (even when Desktop API is enabled for music)."""
+        if self.debug_mode:
+            self.logger.info(f"[{context_message}] Spotify librespot auth check (episode).")
+        cfg = self.settings or {}
+        if not (cfg.get("username") or "").strip():
+            self.logged_in = False
+            if not silent:
+                self.printer.oprint(
+                    "Spotify podcast episodes require Librespot: set your Spotify username in Settings → Spotify. "
+                    "Music can still use Desktop API (cookies + Spotify.dll)."
+                )
+            return False
+        try:
+            if self.spotify_api._is_session_valid(self.spotify_api.librespot_session):
+                self.logged_in = True
+                return True
+            ok = bool(self.spotify_api._load_credentials_and_init_session())
+            self.logged_in = ok
+            if not ok and not silent:
+                self.printer.oprint(
+                    "Spotify Librespot login failed. Complete browser OAuth when prompted for episode downloads."
+                )
+            return ok
+        except SpotifyConfigError:
+            raise
+        except Exception as e_auth_unexpected:
+            self.logger.error(
+                f"[{context_message}] Librespot auth check failed: {e_auth_unexpected}",
+                exc_info=True,
+            )
+            if not silent:
+                self.printer.oprint(f"Spotify Librespot authentication error: {e_auth_unexpected}")
+            self.logged_in = False
+            return False
+
     def _ensure_authenticated(self, context_message: str, silent: bool = False) -> bool:
         """Validate credentials for the selected Spotify backend (Desktop API or Librespot)."""
         if self.debug_mode:
@@ -650,25 +686,45 @@ class ModuleInterface:
         )
 
         try:
+            prefer_episode = bool(
+                extra_kwargs.get("is_episode")
+                or extra_kwargs.get("spotify_media_type") == "episode"
+            )
+
+            def _finalize_episode_info(episode_info_result: TrackInfo) -> TrackInfo:
+                # Episodes use Pathfinder + static episode key (votify); no Desktop API / Librespot login needed.
+                return episode_info_result
+
+            if prefer_episode:
+                self.logger.info(f"Treating ID {track_id} as podcast episode (URL/extra_kwargs).")
+                episode_info_result = self.spotify_api.get_episode_info(
+                    track_id, quality_tier, codec_options, **extra_kwargs
+                )
+                if episode_info_result:
+                    self.logger.info(
+                        f"Successfully fetched episode TrackInfo for ID: {track_id}, Name: {episode_info_result.name}"
+                    )
+                    return _finalize_episode_info(episode_info_result)
+
             # First, attempt to get track info from spotify_api
             track_info_result = self.spotify_api.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
-            if track_info_result:
-                # Only attach error if we have NO metadata at all or if it's a known restricted track
-                # If we have basic info (name, artists) and potentially ISRC, don't scare the user here.
-                # Auth will be re-checked (and prompted if needed) during actual download.
+            if track_info_result and track_info_result.name:
                 if not auth_ok and not track_info_result.tags.isrc:
                     track_info_result.error = error_msg
                 self.logger.info(f"Successfully retrieved TrackInfo for track ID: {track_id}, Name: {track_info_result.name}")
                 return track_info_result
+
+            if track_info_result and not track_info_result.name:
+                self.logger.info(
+                    f"Track metadata for {track_id} has no title (likely an episode), trying episode API..."
+                )
             
-            # If track_info_result is None, try episode fallback
-            self.logger.info(f"Track info returned None for {track_id}, trying as episode...")
+            # If track_info_result is None or unnamed, try episode fallback
+            self.logger.info(f"Track info unavailable for {track_id}, trying as episode...")
             episode_info_result = self.spotify_api.get_episode_info(track_id, quality_tier, codec_options, **extra_kwargs)
             if episode_info_result:
-                if not auth_ok:
-                    episode_info_result.error = error_msg
                 self.logger.info(f"Successfully fetched episode as TrackInfo object for ID: {track_id}")
-                return episode_info_result
+                return _finalize_episode_info(episode_info_result)
             
             # If both failed, return None
             self.logger.warning(f"Failed to get track or episode info for ID: {track_id}")
@@ -685,9 +741,32 @@ class ModuleInterface:
                 codec=CodecEnum.VORBIS
             )
         except SpotifyItemNotFoundError:
+            self.logger.info(f"Track ID {track_id} not found as music track, trying episode...")
+            episode_info_result = self.spotify_api.get_episode_info(
+                track_id, quality_tier, codec_options, **extra_kwargs
+            )
+            if episode_info_result:
+                return _finalize_episode_info(episode_info_result)
             self.logger.warning(f"Track/Episode ID {track_id} not found")
             return None
+        except SpotifyApiError as api_err:
+            err_lower = str(api_err).lower()
+            if "not found" in err_lower or "404" in err_lower or "status code 404" in err_lower:
+                self.logger.info(f"Track fetch failed for {track_id}, trying episode: {api_err}")
+                episode_info_result = self.spotify_api.get_episode_info(
+                    track_id, quality_tier, codec_options, **extra_kwargs
+                )
+                if episode_info_result:
+                    return _finalize_episode_info(episode_info_result)
+            self.logger.error(f"Error getting track/episode info for {track_id}: {api_err}")
+            return None
         except Exception as e:
+            self.logger.info(f"Track info error for {track_id}, trying episode fallback: {e}")
+            episode_info_result = self.spotify_api.get_episode_info(
+                track_id, quality_tier, codec_options, **extra_kwargs
+            )
+            if episode_info_result:
+                return _finalize_episode_info(episode_info_result)
             self.logger.error(f"Error getting track/episode info for {track_id}: {e}")
             return None
 
@@ -880,8 +959,28 @@ class ModuleInterface:
         if codec_options is None:
             codec_options = kwargs.get("codec_options") or kwargs.get("codec_data")
             
+        track_info = kwargs.get("track_info_obj")
+
+        # Check if this is a podcast episode (never use Desktop API / PlayPlay for these)
+        is_episode = False
+        if track_info and hasattr(track_info, 'download_extra_kwargs'):
+            download_kwargs = track_info.download_extra_kwargs
+            if isinstance(download_kwargs, dict):
+                is_episode = download_kwargs.get('is_episode', False)
+        if kwargs.get('is_episode'):
+            is_episode = True
+
+        # Episodes use Pathfinder + static key (no Librespot/Desktop API required).
+        if quality_tier is None:
+            try:
+                quality_tier = QualityEnum.HIGH
+            except Exception:
+                pass
+
         use_dll = self._use_spotify_dll_setting(self.settings)
-        if use_dll:
+        if is_episode:
+            pass
+        elif use_dll:
             wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
             using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
             if using_desktop_api:
@@ -898,34 +997,22 @@ class ModuleInterface:
                     "Spotify Librespot authentication failed in get_track_download, cannot proceed for this track."
                 )
                 return None
-            
-        track_info = kwargs.get("track_info_obj")
         
         # Essential arguments check for the interface layer's immediate needs
         if not track_id or not quality_tier:
             self.logger.error("ModuleInterface.get_track_download: Missing track_id or quality_tier.")
             return None
         
-        # Check if this is known to be an episode from download_extra_kwargs
-        is_episode = False
-        if track_info and hasattr(track_info, 'download_extra_kwargs'):
-            download_kwargs = track_info.download_extra_kwargs
-            if isinstance(download_kwargs, dict):
-                is_episode = download_kwargs.get('is_episode', False)
-        
         try:
             # Pass track_id and quality_tier along with other kwargs
             kwargs['track_id'] = track_id
             kwargs['quality_tier'] = quality_tier
+            kwargs['track_id_str'] = track_id
             
-            # If we know it's an episode, try episode download first
+            # Episodes: librespot only (plain HTTP or CDN — not Desktop API)
             if is_episode:
-                self.logger.info(f"Detected episode from TrackInfo, using episode download for {track_id}")
-                try:
-                    return self.spotify_api.get_episode_download(**kwargs)
-                except Exception as episode_error:
-                    self.logger.warning(f"Episode download failed for {track_id}, trying as track: {episode_error}")
-                    # Fall through to try track download as fallback
+                self.logger.info(f"Detected episode from TrackInfo, using librespot episode download for {track_id}")
+                return self.spotify_api.get_episode_download(**kwargs)
             
             # First try as a regular track
             try:
@@ -934,7 +1021,7 @@ class ModuleInterface:
                 if "Spotify Premium is required" in str(track_error):
                     self.logger.warning(f"Aborting episode fallback: {track_error}")
                     raise track_error
-                # If track download fails, try as episode
+                # Desktop API cannot stream episodes; always try librespot episode path
                 self.logger.info(f"Track download failed for {track_id}, trying as episode: {track_error}")
                 try:
                     return self.spotify_api.get_episode_download(**kwargs)

@@ -30,7 +30,14 @@ PERSISTED_QUERIES = {
     "queryArtistDiscographyAll": "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599",
     "searchDesktop": "fcad5a3e0d5af727fb76966f06971c19cfa2275e6ff7671196753e008611873c",
     "getTrackCredits": "78000490a61250280f2c42f0a1c626e255018659d81d2f83d922b947c6a99e4f",
+    # Podcast episodes (votify / Spotify web client — getEpisodeOrChapter)
+    "getEpisodeOrChapter": "8a62dbdeb7bd79605d7d68b01bcdf83f08bc6c6287ee1665ba012c748a4cf1f3",
 }
+
+STORAGE_RESOLVE_URL = (
+    "https://gue1-spclient.spotify.com/storage-resolve/v2/files/audio/interactive/"
+    "{format_id}/{file_id}?version=10000000&product=9&platform=39&alt=json"
+)
 
 DEFAULT_REQUEST_TIMEOUT = 30  # seconds
 
@@ -273,7 +280,54 @@ class SpotifyEmbedClient:
             raise SpotifyEmbedError("Invalid response: missing 'data' field")
             
         return response["data"]
-    
+
+    def get_episode_metadata(self, episode_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetch podcast episode metadata via Pathfinder (episodeUnionV2).
+        Same GraphQL operation as votify getEpisodeOrChapter.
+        """
+        self.logger.info(f"Fetching episode metadata for ID: {episode_id}")
+        variables = {"uri": f"spotify:episode:{episode_id}"}
+        response = self._graphql_query(
+            "getEpisodeOrChapter", variables, external_token=external_token
+        )
+        if "data" not in response:
+            raise SpotifyEmbedError("Invalid response: missing 'data' field")
+        episode = response["data"].get("episodeUnionV2")
+        if not episode:
+            raise SpotifyEmbedError(f"No episodeUnionV2 in response for {episode_id}")
+        if episode.get("__typename") not in (None, "Episode"):
+            raise SpotifyEmbedError(
+                f"Unexpected episode type for {episode_id}: {episode.get('__typename')}"
+            )
+        playability = episode.get("playability") or {}
+        if playability.get("playable") is False:
+            raise SpotifyEmbedError(f"Episode {episode_id} is not playable")
+        return episode
+
+    def resolve_episode_audio_cdn_urls(
+        self, format_id: str, file_id: str, external_token: Optional[str] = None
+    ) -> list:
+        """Resolve CDN URLs for an episode audio file (storage-resolve v2)."""
+        token = external_token if external_token else self.get_anonymous_token()
+        url = STORAGE_RESOLVE_URL.format(format_id=format_id, file_id=file_id)
+        response = self.session.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=DEFAULT_REQUEST_TIMEOUT,
+        )
+        if response.status_code == 401 and not external_token:
+            self.get_anonymous_token(force_refresh=True)
+            return self.resolve_episode_audio_cdn_urls(format_id, file_id, external_token=None)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("result") != "CDN":
+            raise SpotifyEmbedError(f"storage-resolve failed: {data.get('result')}")
+        cdnurls = data.get("cdnurl") or []
+        if not cdnurls:
+            raise SpotifyEmbedError("storage-resolve returned no CDN URLs")
+        return cdnurls
+
     def get_album_metadata(self, album_id: str, external_token: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch metadata for an album, including all tracks.

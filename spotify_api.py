@@ -113,6 +113,22 @@ DEVICE_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
 DEVICE_SCOPE = "app-remote-control,playlist-modify,playlist-modify-private,playlist-modify-public,playlist-read,playlist-read-collaborative,playlist-read-private,streaming,transfer-auth-session,ugc-image-upload,user-follow-modify,user-follow-read,user-library-modify,user-library-read,user-modify,user-modify-playback-state,user-modify-private,user-personalized,user-read-birthdate,user-read-currently-playing,user-read-email,user-read-play-history,user-read-playback-position,user-read-playback-state,user-read-private,user-read-recently-played,user-top-read"
 DEVICE_FLOW_USER_AGENT = "Spotify/128600502 Win32_x86_64/0 (PC desktop)"
 
+# Podcast episodes (votify): static AES-CTR key — not PlayPlay / Desktop API
+EPISODE_DECRYPTION_KEY = b"\xde\xad\xbe\xef\xde\xad\xbe\xef\xde\xad\xbe\xef\xde\xad\xbe\xef"
+EPISODE_AES_IV_HEX = "72e067fbddcbcf77ebe8bc643f630d93"
+EPISODE_OGG_SKIP_BYTES = 167
+
+# Spotify AudioFile.Format enum id -> name (subset used by episodes)
+EPISODE_FORMAT_NAME_TO_ID = {
+    "OGG_VORBIS_96": "0",
+    "OGG_VORBIS_160": "1",
+    "OGG_VORBIS_320": "2",
+    "MP3_320": "4",
+    "MP3_256": "3",
+    "AAC_24": "8",
+    "MP4_128": "10",
+}
+
 
 def _get_spotify_credentials_dir() -> str:
     """Return the directory for Spotify credentials (credentials.json).
@@ -3193,9 +3209,126 @@ Searching and browsing metadata does NOT require authentication.
                 raise
             raise SpotifyApiError(f"An unexpected error occurred while fetching show {show_id}: {e}")
 
+    def _episode_quality_format_names(self, quality_tier) -> list:
+        """Preferred episode audio formats (Pathfinder names), highest quality first."""
+        qt_str = getattr(quality_tier, "name", str(quality_tier)).upper() if quality_tier else "HIGH"
+        if qt_str in ("LOSSLESS", "HIFI", "VERY_HIGH", "HIGH"):
+            return [
+                "OGG_VORBIS_320",
+                "OGG_VORBIS_160",
+                "OGG_VORBIS_96",
+                "MP3_320",
+                "MP4_128",
+                "AAC_24",
+            ]
+        if qt_str == "LOW":
+            return [
+                "OGG_VORBIS_160",
+                "OGG_VORBIS_96",
+                "MP3_256",
+                "MP4_128",
+            ]
+        return [
+            "OGG_VORBIS_160",
+            "OGG_VORBIS_96",
+            "MP3_256",
+            "MP4_128",
+        ]
+
+    def _fetch_episode_pathfinder(self, episode_id: str) -> Optional[dict]:
+        """Episode metadata via Pathfinder GraphQL (same source as votify)."""
+        try:
+            return self.embed_client.get_episode_metadata(episode_id)
+        except Exception as exc:
+            self.logger.debug(f"Pathfinder episode metadata failed for {episode_id}: {exc}")
+            return None
+
+    @staticmethod
+    def _pathfinder_episode_to_web_dict(episode_id: str, episode_data: dict) -> dict:
+        """Normalize episodeUnionV2 to the shape expected by get_episode_info."""
+        show = (episode_data.get("podcastV2") or {}).get("data") or {}
+        show_uri = show.get("uri") or ""
+        show_id = show_uri.split(":")[-1] if show_uri else None
+        show_name = show.get("name") or "Unknown Show"
+
+        release_date = ""
+        rd = episode_data.get("releaseDate") or {}
+        if isinstance(rd, dict) and rd.get("isoString"):
+            release_date = str(rd["isoString"])[:10]
+
+        duration_ms = 0
+        dur = episode_data.get("duration") or {}
+        if isinstance(dur, dict):
+            duration_ms = int(dur.get("totalMilliseconds") or 0)
+
+        images = []
+        cover = episode_data.get("coverArt") or {}
+        for src in cover.get("sources") or []:
+            if src.get("url"):
+                images.append({"url": src["url"]})
+
+        show_images = []
+        show_cover = show.get("coverArt") or {}
+        for src in show_cover.get("sources") or []:
+            if src.get("url"):
+                show_images.append({"url": src["url"]})
+
+        return {
+            "id": episode_id,
+            "name": episode_data.get("name") or "Unknown Episode",
+            "description": episode_data.get("description") or "",
+            "duration_ms": duration_ms,
+            "explicit": bool(episode_data.get("explicit")),
+            "release_date": release_date,
+            "images": images,
+            "show": {
+                "id": show_id,
+                "name": show_name,
+                "publisher": show_name,
+                "images": show_images,
+                "total_episodes": None,
+            },
+            "_pathfinder_audio_items": (episode_data.get("audio") or {}).get("items") or [],
+        }
+
+    def _select_episode_audio_item(self, episode_id: str, audio_items: list, quality_tier) -> Optional[tuple]:
+        """Return (format_name, format_id, file_id_hex, codec_enum) for best available episode stream."""
+        if not audio_items:
+            return None
+        by_name = {}
+        for item in audio_items:
+            fmt = item.get("format")
+            url = item.get("url") or ""
+            if not fmt or not url:
+                continue
+            file_id = url.rstrip("/").split("/")[-1]
+            if len(file_id) >= 32:
+                by_name[fmt] = file_id
+
+        for fmt_name in self._episode_quality_format_names(quality_tier):
+            file_id = by_name.get(fmt_name)
+            if not file_id:
+                continue
+            format_id = EPISODE_FORMAT_NAME_TO_ID.get(fmt_name)
+            if not format_id:
+                continue
+            if fmt_name.startswith("OGG_VORBIS"):
+                codec = CodecEnum.VORBIS
+            elif fmt_name.startswith("MP3") or fmt_name.startswith("MP4") or fmt_name.startswith("AAC"):
+                codec = CodecEnum.MP3
+            else:
+                codec = CodecEnum.VORBIS
+            return fmt_name, format_id, file_id, codec
+        return None
+
     def get_episode_by_id(self, episode_id: str, market: Optional[str] = None, _retry_attempted: bool = False) -> Optional[dict]:
-        """Get episode details by its Spotify ID using the Web API."""
+        """Get episode metadata — Pathfinder first (votify), Web API v1 as fallback."""
         self.logger.debug(f"SpotifyAPI.get_episode_by_id entered for episode_id: {episode_id}, market: {market}{', retry' if _retry_attempted else ''}")
+
+        pf = self._fetch_episode_pathfinder(episode_id)
+        if pf:
+            self.logger.info(f"Episode {episode_id} metadata from Pathfinder (episodeUnionV2).")
+            return self._pathfinder_episode_to_web_dict(episode_id, pf)
 
         # Use anonymous token from Embed Client
         try:
@@ -3258,12 +3391,113 @@ Searching and browsing metadata does NOT require authentication.
             raise SpotifyApiError(f"Unexpected error fetching episode {episode_id}: {e}")
 
     def get_episode_download(self, **kwargs) -> Optional[TrackDownloadInfo]:
-        if self._use_spotify_dll():
-            raise SpotifyTrackUnavailableError(
-                "Spotify episode downloads are unavailable when using Desktop API (Spotify.dll). "
-                "Switch off 'Use Spotify.dll' to use Librespot for episodes."
+        # Podcasts: votify-style Pathfinder + static episode key (no Desktop API / PlayPlay).
+        try:
+            return self._get_episode_download_pathfinder(**kwargs)
+        except SpotifyTrackUnavailableError:
+            raise
+        except SpotifyAuthError:
+            raise
+        except Exception as pathfinder_err:
+            self.logger.warning(
+                "Pathfinder episode download failed for %s, trying librespot: %s",
+                kwargs.get("track_id") or kwargs.get("episode_id"),
+                pathfinder_err,
             )
         return self._get_episode_download_librespot(**kwargs)
+
+    def _get_episode_download_pathfinder(self, **kwargs) -> Optional[TrackDownloadInfo]:
+        """Download episode audio via storage-resolve + static episode AES key (votify)."""
+        from Crypto.Cipher import AES
+        from Crypto.Util import Counter
+
+        episode_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id") or kwargs.get("episode_id")
+        quality_tier = kwargs.get("quality_tier")
+        track_info_obj = kwargs.get("track_info_obj")
+
+        if not episode_id_base62:
+            raise SpotifyApiError("No episode_id provided for download")
+
+        pf = self._fetch_episode_pathfinder(episode_id_base62)
+        if not pf:
+            raise SpotifyTrackUnavailableError(
+                f"Could not load episode metadata for {episode_id_base62}"
+            )
+
+        audio_items = (pf.get("audio") or {}).get("items") or []
+        selection = self._select_episode_audio_item(episode_id_base62, audio_items, quality_tier)
+        if not selection:
+            raise SpotifyTrackUnavailableError(
+                f"No downloadable audio stream found for episode {episode_id_base62}"
+            )
+        fmt_name, format_id, file_id_hex, output_codec = selection
+
+        cdn_urls = self.embed_client.resolve_episode_audio_cdn_urls(format_id, file_id_hex)
+        iv_int = int.from_bytes(bytes.fromhex(EPISODE_AES_IV_HEX), "big")
+
+        project_root_for_temp = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        target_temp_dir = os.path.join(project_root_for_temp, "temp")
+        os.makedirs(target_temp_dir, exist_ok=True)
+        suffix = ".ogg" if output_codec == CodecEnum.VORBIS else ".mp3"
+        temp_file_path = None
+
+        last_error = None
+        for cdn_url in cdn_urls:
+            try:
+                cipher = AES.new(
+                    EPISODE_DECRYPTION_KEY,
+                    AES.MODE_CTR,
+                    counter=Counter.new(128, initial_value=iv_int),
+                )
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=target_temp_dir) as temp_file:
+                    temp_file_path = temp_file.name
+                with requests.get(cdn_url, stream=True, timeout=DEFAULT_REQUEST_TIMEOUT) as resp:
+                    resp.raise_for_status()
+                    with open(temp_file_path, "wb") as out:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if not chunk:
+                                continue
+                            data = cipher.decrypt(chunk)
+                            if output_codec == CodecEnum.VORBIS and out.tell() == 0 and len(data) > EPISODE_OGG_SKIP_BYTES:
+                                data = data[EPISODE_OGG_SKIP_BYTES:]
+                            out.write(data)
+                with open(temp_file_path, "rb") as check:
+                    magic = check.read(4)
+                if output_codec == CodecEnum.VORBIS and magic != b"OggS":
+                    raise SpotifyApiError(
+                        f"Episode OGG decrypt validation failed (header={magic!r}, format={fmt_name})"
+                    )
+                self.logger.info(
+                    "Episode %s downloaded via Pathfinder (%s, format_id=%s)",
+                    episode_id_base62,
+                    fmt_name,
+                    format_id,
+                )
+                if track_info_obj and hasattr(track_info_obj, "codec"):
+                    track_info_obj.codec = output_codec
+                    if output_codec == CodecEnum.VORBIS:
+                        track_info_obj.bitrate = 96 if "96" in fmt_name else (160 if "160" in fmt_name else 320)
+                    else:
+                        track_info_obj.bitrate = 128
+                        track_info_obj.bit_depth = None
+                return TrackDownloadInfo(
+                    download_type=DownloadEnum.TEMP_FILE_PATH,
+                    temp_file_path=temp_file_path,
+                    different_codec=output_codec,
+                )
+            except Exception as exc:
+                last_error = exc
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                    except OSError:
+                        pass
+                temp_file_path = None
+                self.logger.warning("Episode CDN URL failed: %s", exc)
+
+        raise SpotifyTrackUnavailableError(
+            f"All CDN URLs failed for episode {episode_id_base62}: {last_error}"
+        ) from last_error
 
     def _get_episode_download_librespot(self, **kwargs) -> Optional[TrackDownloadInfo]:
         episode_id_base62 = kwargs.get("track_id_str") or kwargs.get("track_id") or kwargs.get("episode_id")
@@ -3281,10 +3515,20 @@ Searching and browsing metadata does NOT require authentication.
 
         if not self._is_session_valid(self.librespot_session):
             if not self._load_credentials_and_init_session() or not self._is_session_valid(self.librespot_session):
+                if self._use_spotify_dll():
+                    raise SpotifyAuthError(
+                        "Spotify podcast episodes use Librespot (not Desktop API). "
+                        "Configure Spotify username in Settings (Librespot login), or disable "
+                        "'Use Spotify.dll' for all downloads."
+                    )
                 raise SpotifyAuthError("Authentication required/failed for episode download.")
 
         episode_id_obj = EpisodeId.from_hex(episode_id_hex)
         try:
+            from librespot.audio.decoders import FormatOnlyAudioQuality
+            from librespot.audio.format import SuperAudioFormat
+            from librespot.structure import FeederException
+
             librespot_audio_quality_mode = LibrespotAudioQualityEnum.NORMAL
             qt_str = getattr(quality_tier, "name", str(quality_tier)).upper() if quality_tier else ""
             if qt_str in ("LOSSLESS", "HIFI", "VERY_HIGH"):
@@ -3300,25 +3544,56 @@ Searching and browsing metadata does NOT require authentication.
                         handler.addFilter(self._audio_key_filter)
 
             content_feeder = self.librespot_session.content_feeder()
-            stream_loader = content_feeder.load_episode(
-                episode_id_obj,
-                VorbisOnlyAudioQuality(librespot_audio_quality_mode),
-                False,
-                None,
-            )
-            if not stream_loader or not getattr(stream_loader, "input_stream", None):
+            picker_codec_pairs = [
+                (VorbisOnlyAudioQuality(librespot_audio_quality_mode), CodecEnum.VORBIS),
+                (FormatOnlyAudioQuality(librespot_audio_quality_mode, SuperAudioFormat.MP3), CodecEnum.MP3),
+            ]
+            last_load_error = None
+            for audio_picker, output_codec in picker_codec_pairs:
+                try:
+                    stream_loader = content_feeder.load_episode(
+                        episode_id_obj,
+                        audio_picker,
+                        False,
+                        None,
+                    )
+                    if not stream_loader or not getattr(stream_loader, "input_stream", None):
+                        last_load_error = SpotifyTrackUnavailableError(
+                            f"Failed to load audio stream for episode GID {episode_id_hex}"
+                        )
+                        continue
+                    raw_audio_byte_stream = stream_loader.input_stream.stream()
+                    temp_file_path = self._save_stream_to_temp_file(raw_audio_byte_stream, output_codec)
+                    if not temp_file_path:
+                        return None
+                    if track_info_obj and hasattr(track_info_obj, "codec"):
+                        track_info_obj.codec = output_codec
+                        if output_codec == CodecEnum.MP3:
+                            track_info_obj.bitrate = 128
+                            track_info_obj.bit_depth = None
+                    return TrackDownloadInfo(
+                        download_type=DownloadEnum.TEMP_FILE_PATH,
+                        temp_file_path=temp_file_path,
+                        different_codec=output_codec,
+                    )
+                except (FeederException, RuntimeError) as load_err:
+                    last_load_error = load_err
+                    self.logger.debug(
+                        "Episode %s load via %s failed: %s",
+                        episode_id_base62,
+                        output_codec.name,
+                        load_err,
+                    )
+                    continue
+
+            if last_load_error:
+                if isinstance(last_load_error, SpotifyTrackUnavailableError):
+                    raise last_load_error
                 raise SpotifyTrackUnavailableError(
-                    f"Failed to load audio stream for episode GID {episode_id_hex}"
-                )
-            raw_audio_byte_stream = stream_loader.input_stream.stream()
-            temp_file_path = self._save_stream_to_temp_file(raw_audio_byte_stream, CodecEnum.VORBIS)
-            if not temp_file_path:
-                return None
-            if track_info_obj and hasattr(track_info_obj, "codec"):
-                track_info_obj.codec = CodecEnum.VORBIS
-            return TrackDownloadInfo(
-                download_type=DownloadEnum.TEMP_FILE_PATH,
-                temp_file_path=temp_file_path,
+                    f"Episode {episode_id_base62} has no playable Vorbis or MP3 stream ({last_load_error})"
+                ) from last_load_error
+            raise SpotifyTrackUnavailableError(
+                f"Failed to load audio stream for episode GID {episode_id_hex}"
             )
         except SpotifyAuthError:
             raise
@@ -3412,10 +3687,17 @@ Searching and browsing metadata does NOT require authentication.
                 explicit=explicit,
                 cover_url=cover_url,
                 tags=tags,
-                codec=CodecEnum.VORBIS,  # Episodes will be downloaded as VORBIS
+                codec=CodecEnum.VORBIS,  # Episodes download via librespot (Vorbis or MP3)
                 duration=int(duration_ms / 1000) if duration_ms else 0,
-                # Add episode-specific info in error field for debugging
-                error=None
+                error=None,
+                download_extra_kwargs={
+                    "is_episode": True,
+                    "track_id": episode_id,
+                    "track_id_str": episode_id,
+                    "episode_id": episode_id,
+                    "quality_tier": quality_tier,
+                    "codec_options": codec_options,
+                },
             )
             
             self.logger.info(f"Successfully converted episode '{track_name}' to TrackInfo format")

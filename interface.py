@@ -1575,7 +1575,8 @@ class ModuleInterface:
                 track_extra_kwargs=codec_opts if codec_opts is not None else {},
                 id=album_id,
                 upc=album_dict.get('upc'),
-                label=album_dict.get('label')
+                label=album_dict.get('label'),
+                expected_track_count=int(total_tracks_api) if total_tracks_api else None,
             )
         except Exception as parse_error:
             self.logger.error(f"Failed to parse album data for ID {album_id_for_logs}: {parse_error}")

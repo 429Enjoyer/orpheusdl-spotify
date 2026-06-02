@@ -1,7 +1,6 @@
 # Requirements for the OrpheusDL Spotify module
-# Spotify Desktop API is now the only stream method.
+# Audio downloads use the Librespot backend (OAuth). Episodes/lyrics use HTTP APIs.
 pkce>=1.0.3
-unplayplay==0.0.9
 pycryptodome
 protobuf
 httpx

@@ -106,8 +106,6 @@ module_information = ModuleInformation(
         "client_id": "",
         "client_secret": "",
         "cookies_path": "./config/spotify-cookies.txt",
-        "spotify_dll_path": "./Spotify.dll",
-        "use_spotify_dll": "false",
     },
     session_settings={},
     module_supported_modes=[
@@ -161,15 +159,8 @@ class ModuleInterface:
             'artist': {}
         }
 
-    @staticmethod
-    def _use_spotify_dll_setting(settings: dict) -> bool:
-        val = (settings or {}).get("use_spotify_dll")
-        if val is None:
-            return False
-        return str(val).lower() in ("true", "1", "yes")
-
     def _ensure_librespot_authenticated(self, context_message: str, silent: bool = False) -> bool:
-        """Librespot session required for podcast episodes (even when Desktop API is enabled for music)."""
+        """Librespot session required for podcast episodes."""
         if self.debug_mode:
             self.logger.info(f"[{context_message}] Spotify librespot auth check (episode).")
         cfg = self.settings or {}
@@ -177,8 +168,7 @@ class ModuleInterface:
             self.logged_in = False
             if not silent:
                 self.printer.oprint(
-                    "Spotify podcast episodes require Librespot: set your Spotify username in Settings → Spotify. "
-                    "Music can still use Desktop API (cookies + Spotify.dll)."
+                    "Spotify podcast episodes require Librespot: set your Spotify username in Settings → Spotify."
                 )
             return False
         try:
@@ -205,22 +195,11 @@ class ModuleInterface:
             return False
 
     def _ensure_authenticated(self, context_message: str, silent: bool = False) -> bool:
-        """Validate credentials for the selected Spotify backend (Desktop API or Librespot)."""
+        """Validate Librespot credentials for Spotify downloads."""
         if self.debug_mode:
             self.logger.info(f"[{context_message}] Spotify auth check.")
-        use_dll = self._use_spotify_dll_setting(self.settings)
         cfg = self.settings or {}
         try:
-            if use_dll:
-                auth_ok = self.spotify_api.authenticate_stream_api()
-                self.logged_in = bool(auth_ok)
-                if not auth_ok and not silent:
-                    self.printer.oprint(
-                        "Spotify Desktop API requires spotify-cookies.txt (sp_dc) and Spotify.dll. "
-                        "Check Settings → Spotify."
-                    )
-                return bool(auth_ok)
-
             missing = []
             if not (cfg.get("username") or "").strip():
                 missing.append("username")
@@ -233,7 +212,7 @@ class ModuleInterface:
                 if not silent:
                     self.printer.oprint(
                         "Spotify Librespot mode requires: " + ", ".join(missing) + ". "
-                        "Fill these in Settings → Spotify, or enable 'Use Spotify.dll instead'."
+                        "Fill these in Settings → Spotify."
                     )
                 return False
 
@@ -680,9 +659,8 @@ class ModuleInterface:
         # Use silent=True because we'll return the error in TrackInfo.error for the downloader to print.
         auth_ok = self._ensure_authenticated("get_track_info", silent=True)
         error_msg = (
-            "Spotify download requirements missing: place Spotify.dll in root folder "
-            "(next to orpheus.py) and a valid spotify-cookies.txt in config folder "
-            "(next to settings.json)."
+            "Spotify authentication required: set your Spotify username and Developer "
+            "Client ID/Secret in Settings → Spotify, then complete the browser login."
         )
 
         try:
@@ -977,21 +955,7 @@ class ModuleInterface:
             except Exception:
                 pass
 
-        use_dll = self._use_spotify_dll_setting(self.settings)
-        if is_episode:
-            pass
-        elif use_dll:
-            wants_desktop = self.spotify_api.wants_spotify_desktop_stream(quality_tier, codec_options)
-            using_desktop_api = wants_desktop and self.spotify_api.is_desktop_api_available()
-            if using_desktop_api:
-                self.logger.info("Using Desktop API for Spotify stream (FLAC/OGG).")
-            else:
-                if not self._ensure_authenticated("get_track_download"):
-                    self.logger.warning(
-                        "Spotify authentication failed in get_track_download, cannot proceed for this track."
-                    )
-                    return None
-        else:
+        if not is_episode:
             if not self._ensure_authenticated("get_track_download"):
                 self.logger.warning(
                     "Spotify Librespot authentication failed in get_track_download, cannot proceed for this track."
@@ -1088,7 +1052,7 @@ class ModuleInterface:
                     if self.spotify_api.authenticate_stream_api():
                         self.logged_in = True
                         reauth_success = True
-                        self.logger.info("Re-authentication via desktop prerequisites check succeeded.")
+                        self.logger.info("Re-authentication via Librespot succeeded.")
                 
                 except Exception as reauth_err:
                     self.logger.error(f"Re-authentication attempt failed: {reauth_err}", exc_info=True)
@@ -1106,34 +1070,10 @@ class ModuleInterface:
                     self.printer.oprint(f"Re-authentication failed. {e}", drop_level=0)
                     return None
             else:
-                lowered = error_str.lower()
-                if "desktop ogg decrypt validation failed" in lowered:
-                    self.printer.oprint(
-                        "Spotify desktop stream downloaded, but OGG validation failed after decrypt. "
-                        "Please retry later and refresh spotify-cookies.txt if it keeps failing.",
-                        drop_level=0,
-                    )
-                elif "desktop flac decrypt validation failed" in lowered:
-                    self.printer.oprint(
-                        "Spotify desktop stream downloaded, but FLAC validation failed after decrypt. "
-                        "Please retry later and refresh spotify-cookies.txt if it keeps failing.",
-                        drop_level=0,
-                    )
-                elif "desktop download failure" in lowered and "decrypt validation failed" in lowered:
-                    self.printer.oprint(
-                        "Spotify desktop decrypt validation failed for this track. "
-                        "Please retry later.",
-                        drop_level=0,
-                    )
-                else:
-                    self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
-                is_decrypt_validation = "decrypt validation failed" in error_str.lower()
-                if is_decrypt_validation:
-                    self.logger.warning(f"SpotifyApiError during track download: {e}")
-                else:
-                    self.logger.error(
-                        f"SpotifyApiError during track download: {e}", exc_info=self.debug_mode
-                    )
+                self.printer.oprint(f"Spotify API error during track download: {e}", drop_level=0)
+                self.logger.error(
+                    f"SpotifyApiError during track download: {e}", exc_info=self.debug_mode
+                )
                 return None
         except Exception as e:
             self.printer.oprint(f"An unexpected error occurred during Spotify track download: {e}", drop_level=0)

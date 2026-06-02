@@ -6,7 +6,7 @@ A Spotify module for the OrpheusDL modular archival music program
 
 1.  **Spotify Premium Account:** Essential for accessing audio streams in high quality.
 2.  **OrpheusDL:** [My fork](https://github.com/bascurtiz/orpheusdl) is needed to make Spotify's module work.
-3.  **Desktop API method:** Spotify downloads use the Desktop API pathway only.
+3.  **Librespot method:** Spotify downloads use the Librespot pathway only.
 
 ## Installation
 
@@ -31,8 +31,7 @@ A Spotify module for the OrpheusDL modular archival music program
 
 6.  Add Redirect URI: http://127.0.0.1:4381/login
 
-7.  Optional: For FLAC & lyrics, Export as `spotify-cookies.txt`, same method as described for Apple Music (place it in the `/config` folder).
-    Make sure `Spotify.dll` is in root folder next to `orpheus.py`, download [here](https://mega.nz/file/Zdx0FDha#yASfMcAFxqXM9O4yjgqy2-gTZ5qY8DhSb5xsYvlUhsA).
+7.  Optional: For lyrics, Export as `spotify-cookies.txt`, same method as described for Apple Music (place it in the `/config` folder).
 
 8.  Run a download command with any legit Spotify URL:
     ```
@@ -55,7 +54,7 @@ When enabling the Spotify module in OrpheusDL (e.g., via `config/settings.json` 
 
 This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange) flow for both:
 *   **GraphQL / Embed API Access:** For searching, retrieving metadata (track, album, playlist, artist info).
-*   **Stream API Access:** For accessing audio streams for downloads via the Desktop API pathway.
+*   **Stream API Access:** For accessing audio streams for downloads via the Librespot pathway.
 
 **Process:**
 
@@ -79,7 +78,7 @@ This module primarily uses a unified OAuth 2.0 PKCE (Proof Key for Code Exchange
 **Lossless (HiFi/FLAC) downloads are NOT supported** as the underlying stream from Spotify is (still) lossy.
 *   **Terms of Service:** Downloading streams may violate Spotify\'s Terms of Service. Use this module responsibly and at your own risk.
 *   **Premium Required:** This module **will not work** with Spotify Free accounts.
-*   **Internal Stability:** Relies on the integrated Desktop API implementation.
+*   **Internal Stability:** Relies on the integrated Librespot implementation.
 
 ## Usage
 

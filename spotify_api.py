@@ -17,14 +17,13 @@ import platform
 import subprocess as sp
 import httpx
 
-from utils.utils import find_system_ffmpeg, get_clean_env
+from utils.utils import find_system_ffmpeg, get_clean_env, open_url_in_browser
 from utils.vendor_bootstrap import bootstrap_vendor_paths
 bootstrap_vendor_paths()
 # librespot protobuf stubs require pure-Python parsing with protobuf 4+ / 5+ / 6+
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 # OAuth and HTTP server imports for Zotify-style authentication
-import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -328,30 +327,18 @@ class OAuth:
         try:
             time.sleep(1.0) # Grace period for HTTP server to stabilize
             
-            # Prioritize os.startfile on Windows as it is more reliable for default browsers
-            opened = False
-            if platform.system() == "Windows":
+            opened = open_url_in_browser(auth_url)
+            if opened:
+                self.logger.info("Successfully opened browser for authorization.")
+            elif platform.system() == "Windows":
                 try:
-                    os.startfile(auth_url)
-                    opened = True
-                    self.logger.info("Successfully opened browser via os.startfile.")
-                except Exception as e_start:
-                    self.logger.warning(f"os.startfile failed: {e_start}")
-
-            if not opened:
-                try:
-                    webbrowser.open(auth_url)
-                    opened = True
-                except Exception as e_wb:
-                    self.logger.warning(f"webbrowser.open failed: {e_wb}")
-
-            if not opened:
-                # Last resort fallback
-                if platform.system() == "Windows":
                     import subprocess
                     subprocess.run(["cmd", "/c", "start", "", auth_url], shell=True)
-                else:
-                    self.logger.error(f"Could not open browser automatically. Please copy the URL manually.")
+                    opened = True
+                except Exception as e_cmd:
+                    self.logger.warning(f"cmd start fallback failed: {e_cmd}")
+            if not opened:
+                self.logger.error("Could not open browser automatically. Please copy the URL manually.")
         except Exception as e_final:
             self.logger.error(f"Ultimate failure opening browser: {e_final}")
 
